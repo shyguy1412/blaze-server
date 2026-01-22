@@ -4,6 +4,7 @@ use std::{
     pin::Pin,
     process::ExitCode,
     sync::mpsc::{Receiver, Sender},
+    usize,
 };
 
 use httparse::{self, EMPTY_HEADER, Header, Request, Response};
@@ -69,36 +70,38 @@ pub async fn cycle_executor(executor: &smol::Executor<'_>, receiver: &Receiver<A
 
 pub async fn handle_stream(stream: Async<TcpStream>) -> Result<(), Box<dyn Error>> {
     let bytes = &mut stream.bytes();
-    let buff = parse_path(bytes).await?;
-    let headers = &mut [EMPTY_HEADER; 0];
+    let (buff, header_count) = read_header(bytes).await?;
+
+    let headers = &mut *vec![EMPTY_HEADER; header_count].into_boxed_slice();
 
     let mut request = Request::new(headers);
     request.parse(buff.as_slice())?;
 
-    let path = match request.path {
-        Some(p) => p,
-        None => {
-            println!("malformed request");
-            return Ok(());
-        }
-    };
-
-    println!("{path}");
+    println!("{:?}", request);
     Ok(())
 }
 
-async fn parse_path(bytes: &mut Bytes<Async<TcpStream>>) -> Result<Vec<u8>, Box<dyn Error>> {
-    let mut buff = Vec::with_capacity(500);
+async fn read_header(
+    bytes: &mut Bytes<Async<TcpStream>>,
+) -> Result<(Vec<u8>, usize), Box<dyn Error>> {
+    let mut header_count = usize::MAX - 1; //adjust for overcounting
+    let mut buff = Vec::with_capacity(4000);
+
     while let Some(byte) = bytes.next().await {
         buff.push(byte?);
 
-        if buff.len() < 2 {
+        if buff.len() < 4 {
             continue;
         }
 
         if buff[buff.len() - 2..] == *b"\r\n" {
+            header_count = header_count.wrapping_add(1);
+        }
+
+        if buff[buff.len() - 4..] == *b"\r\n\r\n" {
             break;
         }
     }
-    Ok(buff)
+    buff.shrink_to_fit();
+    Ok((buff, header_count))
 }
