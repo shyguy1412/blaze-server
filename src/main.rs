@@ -1,21 +1,71 @@
 mod api;
+mod router;
 
 use std::{
-    error::Error,
     net::{Ipv4Addr, SocketAddrV4},
+    ops::{Deref, DerefMut},
     process::ExitCode,
     sync::mpsc::{Receiver, Sender},
     usize,
 };
 
-use httparse::{EMPTY_HEADER, Request};
+use httparse::{EMPTY_HEADER, Header, Request};
 use smol::{
     io::AsyncReadExt,
     net::{TcpListener, TcpStream},
     stream::StreamExt,
 };
+use url::Url;
+
+type Result<T> = core::result::Result<T, Box<dyn std::error::Error>>;
 
 const ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 3333);
+
+#[derive(Clone, Copy, Debug)]
+enum Error {
+    MalformedRequest,
+    InvalidMethod,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for Error {}
+
+#[derive(Clone, Copy, Debug)]
+enum HttpMethod {
+    GET,
+    PUT,
+    POST,
+    DELETE,
+    OPTION,
+    TRACE,
+}
+
+impl TryFrom<&String> for HttpMethod {
+    fn try_from(value: &String) -> std::result::Result<HttpMethod, Self::Error> {
+        use HttpMethod::*;
+        match value.to_ascii_uppercase().as_str() {
+            "GET" => Ok(GET),
+            "PUT" => Ok(PUT),
+            "POST" => Ok(POST),
+            "DELETE" => Ok(DELETE),
+            "OPTION" => Ok(OPTION),
+            "TRACE" => Ok(TRACE),
+            _ => Err(Error::InvalidMethod),
+        }
+    }
+
+    type Error = Error;
+}
+
+impl std::fmt::Display for HttpMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
 
 fn main() -> ExitCode {
     let Ok(socket) = smol::block_on(TcpListener::bind(ADDR)) else {
@@ -41,7 +91,6 @@ fn main() -> ExitCode {
 
 #[inline(always)]
 pub fn add_to_queue(stream: TcpStream, sender: &Sender<TcpStream>) {
-    println!("INCOMING");
     if let Err(e) = sender.send(stream) {
         println!("{e}; connection dropped")
     };
@@ -49,8 +98,8 @@ pub fn add_to_queue(stream: TcpStream, sender: &Sender<TcpStream>) {
 
 #[inline(always)]
 fn handler_thread(receiver: Receiver<TcpStream>) {
-    async fn task_wrapper(mut stream: TcpStream) {
-        let result = handle_stream(&mut stream).await;
+    async fn task_wrapper(stream: TcpStream) {
+        let result = handle_stream(stream).await;
 
         if let Err(e) = result {
             println!("{e}");
@@ -85,10 +134,27 @@ fn handler_thread(receiver: Receiver<TcpStream>) {
 }
 
 #[inline(always)]
-async fn read_header(stream: &mut TcpStream) -> Result<(Vec<u8>, usize), Box<dyn Error>> {
+async fn read_first_line(stream: &mut TcpStream, buff: &mut Vec<u8>) -> Result<()> {
     let bytes = &mut stream.bytes();
-    let mut header_count = usize::MAX - 1; //adjust for overcounting
-    let mut buff = Vec::with_capacity(4000);
+
+    while let Some(byte) = bytes.next().await {
+        buff.push(byte?);
+
+        if buff.len() < 2 {
+            continue;
+        }
+
+        if buff[buff.len() - 2..] == *b"\r\n" {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[inline(always)]
+async fn read_header(stream: &mut TcpStream, buff: &mut Vec<u8>) -> Result<usize> {
+    let bytes = &mut stream.bytes();
+    let mut header_count = usize::MAX; //adjust for overcounting
 
     while let Some(byte) = bytes.next().await {
         buff.push(byte?);
@@ -105,19 +171,84 @@ async fn read_header(stream: &mut TcpStream) -> Result<(Vec<u8>, usize), Box<dyn
             break;
         }
     }
-    buff.shrink_to_fit();
-    Ok((buff, header_count))
+    Ok(header_count)
 }
 
 #[inline(always)]
-pub async fn handle_stream(stream: &mut TcpStream) -> Result<(), Box<dyn Error>> {
-    let (buff, header_count) = read_header(stream).await?;
+pub async fn handle_stream(mut stream: TcpStream) -> Result<()> {
+    let mut buffer = Vec::with_capacity(4000);
 
-    let headers = &mut *vec![EMPTY_HEADER; header_count].into_boxed_slice();
+    read_first_line(&mut stream, &mut buffer).await?;
 
-    let request = &mut Request::new(headers);
-    request.parse(buff.as_slice())?;
+    let [method, path, http_version]: &[String] = &buffer[0..buffer.len() - 2]
+        .split(|a| *a as char == ' ')
+        .filter_map(|chunk| str::from_utf8(chunk).ok())
+        .map(|str| str.to_string())
+        .collect::<Vec<_>>()
+    else {
+        return Err(Error::MalformedRequest)?;
+    };
 
-    println!("{:?}", request);
+    let url = Url::parse(&format!("http://local{path}"))?;
+    let method: HttpMethod = method.try_into()?;
+
+    let header_count = read_header(&mut stream, &mut buffer).await?;
+    let endpoint = router::route(url).await?;
+
+    let request = OwnedRequest::new(buffer, header_count).ok_or(Error::MalformedRequest)?;
+
+    endpoint(request, stream).await;
+
+    println!("Method: {method}; Path: {path}; HTTP Version: {http_version}");
+
     Ok(())
+}
+
+struct OwnedRequest {
+    buffer: *mut Vec<u8>,
+    headers: *mut [Header<'static>],
+    request: Request<'static, 'static>,
+}
+
+impl Deref for OwnedRequest {
+    type Target = Request<'static, 'static>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+impl DerefMut for OwnedRequest {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.request
+    }
+}
+
+impl OwnedRequest {
+    pub fn new(buffer: Vec<u8>, header_count: usize) -> Option<Self> {
+        let headers = Box::into_raw(vec![EMPTY_HEADER; header_count].into_boxed_slice());
+        let buffer = Box::into_raw(Box::new(buffer));
+        let mut request: Request<'static, 'static> =
+            Request::new(unsafe { headers.as_mut().expect("It as literally just created") });
+
+        request
+            .parse(unsafe { buffer.as_ref().expect("Was just created") })
+            .inspect_err(|e| println!("{e:?}, {header_count}"))
+            .ok()?;
+
+        Some(OwnedRequest {
+            buffer,
+            headers,
+            request,
+        })
+    }
+}
+
+impl Drop for OwnedRequest {
+    fn drop(&mut self) {
+        unsafe {
+            drop(Box::from_raw(self.buffer));
+            drop(Box::from_raw(self.headers))
+        }
+    }
 }
